@@ -1,0 +1,487 @@
+import { describe, expect, it } from "vitest";
+import {
+	confidenceTier,
+	formatDocumentScores,
+	formatDocumentViolations,
+	formatJson,
+	formatLineReport,
+	formatStats,
+	indexToRuleKey,
+	isScoreViolation,
+} from "./report.ts";
+import type { FlagMap } from "./types.ts";
+
+describe("report", () => {
+	it("indexToRuleKey generates bijective base-26 letter keys", () => {
+		const indices = [0, 25, 26, 27, 51, 52, 701, 702];
+		const mapped = indices.map((i) => ({ index: i, key: indexToRuleKey(i) }));
+		expect(mapped).toMatchInlineSnapshot(`
+			[
+			  {
+			    "index": 0,
+			    "key": "A",
+			  },
+			  {
+			    "index": 25,
+			    "key": "Z",
+			  },
+			  {
+			    "index": 26,
+			    "key": "AA",
+			  },
+			  {
+			    "index": 27,
+			    "key": "AB",
+			  },
+			  {
+			    "index": 51,
+			    "key": "AZ",
+			  },
+			  {
+			    "index": 52,
+			    "key": "BA",
+			  },
+			  {
+			    "index": 701,
+			    "key": "ZZ",
+			  },
+			  {
+			    "index": 702,
+			    "key": "AAA",
+			  },
+			]
+		`);
+	});
+	it("confidenceTier classifies confidence levels", () => {
+		const levels = [0.9, 0.8, 0.7, 0.5, 0.4, 0.0].map((c) => ({
+			conf: c,
+			tier: confidenceTier(c),
+		}));
+		expect(levels).toMatchInlineSnapshot(`
+			[
+			  {
+			    "conf": 0.9,
+			    "tier": "high",
+			  },
+			  {
+			    "conf": 0.8,
+			    "tier": "high",
+			  },
+			  {
+			    "conf": 0.7,
+			    "tier": "mid",
+			  },
+			  {
+			    "conf": 0.5,
+			    "tier": "mid",
+			  },
+			  {
+			    "conf": 0.4,
+			    "tier": "low",
+			  },
+			  {
+			    "conf": 0,
+			    "tier": "low",
+			  },
+			]
+		`);
+	});
+
+	it("formatLineReport formats flagged lines with letter keys", () => {
+		const lines = [
+			"Empowering our users",
+			"Clean line here",
+			"Another bad line",
+		];
+		const flags: FlagMap = new Map([
+			[0, ["banned_word", "puffery"]],
+			[2, ["banned_word"]],
+		]);
+		const questions = {
+			banned_word: { type: "noul" as const, instructions: "Check banned" },
+			puffery: { type: "noul" as const, instructions: "Check puffery" },
+		};
+
+		const report = formatLineReport(lines, flags, questions);
+		expect(report).toMatchInlineSnapshot(`
+			[
+			  "A=banned_word, B=puffery",
+			  "",
+			  "A,B             | L0001: Empowering our users",
+			  "A               | L0003: Another bad line",
+			]
+		`);
+	});
+
+	it("formatLineReport indicates when no line rule violations are found", () => {
+		const lines = ["Clean line one", "Clean line two"];
+		const flags: FlagMap = new Map();
+		const questions = {
+			banned_word: { type: "noul" as const, instructions: "Check banned" },
+			puffery: { type: "noul" as const, instructions: "Check puffery" },
+		};
+
+		const report = formatLineReport(lines, flags, questions);
+		expect(report).toMatchInlineSnapshot(`
+			[
+			  "A=banned_word, B=puffery",
+			  "",
+			  "No line rule violations found.",
+			]
+		`);
+	});
+
+	it("formatLineReport handles more than 26 rules using AA-style keys", () => {
+		const lines = ["Empowering our users", "Some typo or issue"];
+		const ruleNames = [
+			"banned_word",
+			"empty_adverb",
+			"empty_phrase",
+			"binary_contrast",
+			"throat_clearing",
+			"faux_insight",
+			"colon_reveal",
+			"negative_listing",
+			"dramatic_fragmentation",
+			"rhetorical_setup",
+			"superficial_analysis",
+			"importance_puffery",
+			"interpretive_meta",
+			"weasel_attribution",
+			"fake_strong_verb",
+			"synonym_cycling",
+			"fake_profound_kicker",
+			"summary_recap",
+			"formatting_slop",
+			"em_dash_crutch",
+			"minimizing_complexity",
+			"undefined_jargon",
+			"ambiguous_reference",
+			"missing_version_qualifier",
+			"magic_value",
+			"stale_placeholder",
+			"typo_or_misspelling",
+			"passive_voice_overuse",
+			"comma_splice",
+			"dangling_modifier",
+			"run_on_sentence",
+			"subject_verb_disagreement",
+			"wrong_homophone",
+			"noun_pile_up",
+		];
+		const questions = Object.fromEntries(
+			ruleNames.map((name) => [
+				name,
+				{ type: "noul" as const, instructions: name },
+			]),
+		);
+		const flags: FlagMap = new Map([
+			[0, ["banned_word", "stale_placeholder", "typo_or_misspelling"]],
+			[1, ["noun_pile_up"]],
+		]);
+		const report = formatLineReport(lines, flags, questions);
+		expect(report).toMatchInlineSnapshot(`
+			[
+			  "A=banned_word, B=empty_adverb, C=empty_phrase, D=binary_contrast, E=throat_clearing, F=faux_insight, G=colon_reveal, H=negative_listing, I=dramatic_fragmentation, J=rhetorical_setup, K=superficial_analysis, L=importance_puffery, M=interpretive_meta, N=weasel_attribution, O=fake_strong_verb, P=synonym_cycling, Q=fake_profound_kicker, R=summary_recap, S=formatting_slop, T=em_dash_crutch, U=minimizing_complexity, V=undefined_jargon, W=ambiguous_reference, X=missing_version_qualifier, Y=magic_value, Z=stale_placeholder, AA=typo_or_misspelling, AB=passive_voice_overuse, AC=comma_splice, AD=dangling_modifier, AE=run_on_sentence, AF=subject_verb_disagreement, AG=wrong_homophone, AH=noun_pile_up",
+			  "",
+			  "A,Z,AA          | L0001: Empowering our users",
+			  "AH              | L0002: Some typo or issue",
+			]
+		`);
+	});
+
+	it("formatDocumentScores formats scores with criteria and confidence", () => {
+		const scores = {
+			engagement: {
+				type: "score" as const,
+				score: 2.5,
+				confidence: 0.6,
+			},
+			clarity: {
+				type: "score" as const,
+				score: 2.0,
+				confidence: 0.9,
+			},
+		};
+		const questions = {
+			engagement: {
+				type: "score" as const,
+				instructions: "Rate engagement",
+				criteria: [
+					"Dull — lacks energy",
+					"Fair — readable",
+					"Good — engaging",
+					"Exceptional — captivating",
+				],
+			},
+			clarity: {
+				type: "score" as const,
+				instructions: "Rate clarity",
+				criteria: ["Confusing", "Readable", "Crystal clear"],
+			},
+		};
+
+		const formatted = formatDocumentScores(scores, questions);
+		expect(formatted).toMatchInlineSnapshot(`
+			[
+			  "
+			## Document Scores
+			",
+			  "engagement  2.5/3   (confidence mid )  "Good" ↔ "Exceptional"",
+			  "clarity     2.0/2   (confidence high)  "Crystal clear"",
+			]
+		`);
+	});
+
+	it("isScoreViolation correctly determines whether score is below passing threshold", () => {
+		expect(isScoreViolation(0.5, 2)).toBe(true);
+		expect(isScoreViolation(1.0, 2)).toBe(true);
+		expect(isScoreViolation(2.0, 2)).toBe(false);
+		expect(isScoreViolation(1.8, 3)).toBe(true);
+		expect(isScoreViolation(2.0, 3)).toBe(false);
+		expect(isScoreViolation(3.0, 3)).toBe(false);
+	});
+
+	it("formatDocumentViolations formats document boolean violations", () => {
+		const docFlags = ["executive_summary_present"];
+		const questions = {
+			executive_summary_present: {
+				type: "noul" as const,
+				instructions: "Check if summary is present",
+			},
+		};
+		const out = formatDocumentViolations(docFlags, questions);
+		expect(out).toMatchInlineSnapshot(`
+			[
+			  "
+			## Document Violations
+			",
+			  "* executive_summary_present — Check if summary is present",
+			]
+		`);
+	});
+
+	it("formatJson produces structured JSON output with document violations", () => {
+		const lines = ["Empowering our users", "Clean line"];
+		const flags: FlagMap = new Map([[0, ["banned_word"]]]);
+		const scores = {
+			engagement: {
+				type: "score" as const,
+				score: 0.5,
+				confidence: 0.85,
+			},
+		};
+		const docQuestions = {
+			engagement: {
+				type: "score" as const,
+				instructions: "Rate engagement",
+				criteria: ["Low", "Mid", "High"],
+			},
+		};
+		const docFlags = ["has_exec_summary"];
+
+		const jsonStr = formatJson(
+			"/path/to/file.txt",
+			["/path/to/rules.json"],
+			lines,
+			flags,
+			scores,
+			docQuestions,
+			docFlags,
+		);
+		expect(JSON.parse(jsonStr)).toMatchInlineSnapshot(`
+			{
+			  "file": "/path/to/file.txt",
+			  "rules": [
+			    "/path/to/rules.json",
+			  ],
+			  "violations": {
+			    "document": {
+			      "engagement": {
+			        "confidence": 0.85,
+			        "label": "Mid",
+			        "max": 2,
+			        "score": 0.5,
+			      },
+			      "has_exec_summary": {
+			        "rule": "has_exec_summary",
+			        "type": "noul",
+			      },
+			    },
+			    "lines": [
+			      {
+			        "lineNum": 1,
+			        "rules": [
+			          "banned_word",
+			        ],
+			        "text": "Empowering our users",
+			      },
+			    ],
+			  },
+			}
+		`);
+	});
+
+	it("formatJson produces empty violations when document scores are passing and clean", () => {
+		const lines = ["Clean line"];
+		const flags: FlagMap = new Map();
+		const scores = {
+			engagement: {
+				type: "score" as const,
+				score: 2.0,
+				confidence: 0.9,
+			},
+		};
+		const docQuestions = {
+			engagement: {
+				type: "score" as const,
+				instructions: "Rate engagement",
+				criteria: ["Low", "Mid", "High"],
+			},
+		};
+
+		const jsonStr = formatJson(
+			"/path/to/file.txt",
+			["/path/to/rules.json"],
+			lines,
+			flags,
+			scores,
+			docQuestions,
+			[],
+		);
+		expect(JSON.parse(jsonStr)).toMatchInlineSnapshot(`
+			{
+			  "file": "/path/to/file.txt",
+			  "rules": [
+			    "/path/to/rules.json",
+			  ],
+			  "violations": {
+			    "document": {},
+			    "lines": [],
+			  },
+			}
+		`);
+	});
+
+	it("formatStats formats execution stats with breakdown when mixed scopes", () => {
+		const stats = {
+			rules: 6,
+			lineRules: 5,
+			docRules: 1,
+			lines: 12,
+			questions: 61,
+			apiCalls: 6,
+			apiQuestions: 61,
+		};
+		expect(formatStats(stats)).toMatchInlineSnapshot(`
+			[
+			  "
+			## Stats
+			",
+			  "Rules applied:                6 (5 line, 1 document)",
+			  "Lines evaluated:              12",
+			  "Questions asked:              61",
+			  "API calls:                    6",
+			  "Questions evaluated via API:  61",
+			]
+		`);
+	});
+
+	it("formatStats formats execution stats without breakdown when single scope", () => {
+		const stats = {
+			rules: 5,
+			lineRules: 5,
+			docRules: 0,
+			lines: 10,
+			questions: 50,
+			apiCalls: 5,
+			apiQuestions: 50,
+		};
+		expect(formatStats(stats)).toMatchInlineSnapshot(`
+			[
+			  "
+			## Stats
+			",
+			  "Rules applied:                5",
+			  "Lines evaluated:              10",
+			  "Questions asked:              50",
+			  "API calls:                    5",
+			  "Questions evaluated via API:  50",
+			]
+		`);
+	});
+
+	it("formatStats includes cacheHits when defined", () => {
+		const stats = {
+			rules: 5,
+			lineRules: 5,
+			docRules: 0,
+			lines: 10,
+			questions: 50,
+			apiCalls: 1,
+			apiQuestions: 42,
+			cacheHits: 8,
+		};
+		expect(formatStats(stats)).toMatchInlineSnapshot(`
+			[
+			  "
+			## Stats
+			",
+			  "Rules applied:                5",
+			  "Lines evaluated:              10",
+			  "Questions asked:              50",
+			  "API calls:                    1",
+			  "Questions evaluated via API:  42",
+			  "Cache hits:                   8",
+			]
+		`);
+	});
+
+	it("formatJson includes stats when provided", () => {
+		const lines = ["Sample text"];
+		const flags: FlagMap = new Map();
+		const scores = {};
+		const docQuestions = {};
+		const stats = {
+			rules: 1,
+			lineRules: 1,
+			docRules: 0,
+			lines: 1,
+			questions: 1,
+			apiCalls: 1,
+			apiQuestions: 1,
+		};
+
+		const jsonStr = formatJson(
+			"/path/to/file.txt",
+			["/path/to/rules.json"],
+			lines,
+			flags,
+			scores,
+			docQuestions,
+			[],
+			stats,
+		);
+		expect(JSON.parse(jsonStr)).toMatchInlineSnapshot(`
+			{
+			  "file": "/path/to/file.txt",
+			  "rules": [
+			    "/path/to/rules.json",
+			  ],
+			  "stats": {
+			    "apiCalls": 1,
+			    "apiQuestions": 1,
+			    "docRules": 0,
+			    "lineRules": 1,
+			    "lines": 1,
+			    "questions": 1,
+			    "rules": 1,
+			  },
+			  "violations": {
+			    "document": {},
+			    "lines": [],
+			  },
+			}
+		`);
+	});
+});

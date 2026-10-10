@@ -1,0 +1,216 @@
+import assert from "node:assert/strict";
+import type { DecisionsScoreAnswer } from "@openrouter/sdk/models/decisionsscoreanswer";
+import { lineMarker } from "./batch.ts";
+import type { FlagMap, NoulQuestion, Question, Stats } from "./types.ts";
+
+const CONF_HIGH = 0.8;
+const CONF_MID = 0.5;
+
+export function isScoreViolation(score: number, max: number): boolean {
+	return max > 0 ? score < max * (2 / 3) : false;
+}
+
+export function indexToRuleKey(index: number): string {
+	assert(index >= 0, "Rule index must be non-negative");
+	let key = "";
+	let n = index;
+	while (n >= 0) {
+		key = String.fromCharCode(65 + (n % 26)) + key;
+		n = Math.floor(n / 26) - 1;
+	}
+	return key;
+}
+
+export function confidenceTier(conf: number): "low" | "mid" | "high" {
+	if (conf >= CONF_HIGH) return "high";
+	if (conf >= CONF_MID) return "mid";
+	return "low";
+}
+
+export function formatLineReport(
+	allLines: string[],
+	flags: FlagMap,
+	questions: Record<string, NoulQuestion>,
+): string[] {
+	if (!Object.keys(questions).length) return [];
+	const ids = Object.keys(questions).map(
+		(k, i) => [k, indexToRuleKey(i)] as const,
+	);
+	const keyToLetter = new Map(ids.map(([k, v]) => [k, v]));
+
+	const out: string[] = [];
+	out.push(ids.map(([k, v]) => `${v}=${k}`).join(", "));
+	out.push("");
+
+	let hasViolations = false;
+	for (let lineIndex = 0; lineIndex < allLines.length; lineIndex++) {
+		const lineFlags = flags.get(lineIndex);
+		if (!lineFlags?.length) continue;
+		hasViolations = true;
+		const letters = lineFlags.map((k) => keyToLetter.get(k) ?? k);
+		out.push(
+			`${letters.join(",").padEnd(15)} | ${lineMarker(lineIndex)}: ${allLines[lineIndex]}`,
+		);
+	}
+
+	if (!hasViolations) {
+		out.push("No line rule violations found.");
+	}
+
+	return out;
+}
+
+export function formatDocumentViolations(
+	docFlags: string[],
+	questions: Record<string, Question>,
+): string[] {
+	if (!docFlags.length) return [];
+	const out: string[] = [];
+	out.push("\n## Document Violations\n");
+	for (const key of docFlags) {
+		const q = questions[key];
+		const summary = q ? ` — ${q.instructions}` : "";
+		out.push(`* ${key}${summary}`);
+	}
+	return out;
+}
+
+export function formatDocumentScores(
+	scores: Record<string, DecisionsScoreAnswer>,
+	questions: Record<string, Question>,
+): string[] {
+	const scoreEntries = Object.entries(scores).filter(
+		([k]) => questions[k]?.type === "score",
+	);
+	if (!scoreEntries.length) return [];
+
+	const out: string[] = [];
+	out.push("\n## Document Scores\n");
+
+	const nameWidth = Math.max(...scoreEntries.map(([k]) => k.length));
+
+	for (const [key, answer] of scoreEntries) {
+		const q = questions[key];
+		if (q?.type !== "score") continue;
+		const { criteria } = q;
+
+		const max = criteria.length - 1;
+		const { score, confidence = 0 } = answer;
+		const tier = confidenceTier(confidence);
+		const frac = score % 1;
+		const isBetween = frac > 0.2 && frac < 0.8;
+		const showBoth = isBetween && tier !== "high";
+
+		let label: string;
+		if (showBoth) {
+			const lo = criteria[Math.floor(score)] ?? "";
+			const hi = criteria[Math.ceil(score)] ?? "";
+			const trim = (s: string) => s.split(" — ")[0] ?? s;
+			label = `"${trim(lo)}" ↔ "${trim(hi)}"`;
+		} else {
+			label = `"${criteria[Math.round(score)] ?? ""}"`;
+		}
+
+		const name = key.padEnd(nameWidth);
+		const scoreStr = `${score.toFixed(1)}/${max}`;
+		out.push(
+			`${name}  ${scoreStr.padEnd(6)}  (confidence ${tier.padEnd(4)})  ${label}`,
+		);
+	}
+	return out;
+}
+
+export function formatStats(stats: Stats): string[] {
+	const breakdown =
+		stats.docRules > 0 && stats.lineRules > 0
+			? ` (${stats.lineRules} line, ${stats.docRules} document)`
+			: "";
+	const rows: Array<[string, string]> = [
+		["Rules applied:", `${stats.rules}${breakdown}`],
+		["Lines evaluated:", `${stats.lines}`],
+		["Questions asked:", `${stats.questions}`],
+		["API calls:", `${stats.apiCalls}`],
+		["Questions evaluated via API:", `${stats.apiQuestions}`],
+	];
+	if (stats.cacheHits !== undefined) {
+		rows.push(["Cache hits:", `${stats.cacheHits}`]);
+	}
+
+	const maxLabel = Math.max(...rows.map(([label]) => label.length));
+	return [
+		"\n## Stats\n",
+		...rows.map(([label, val]) => `${label.padEnd(maxLabel)}  ${val}`),
+	];
+}
+
+export function formatJson(
+	filePath: string,
+	rulesPaths: string[],
+	allLines: string[],
+	flags: FlagMap,
+	scores: Record<string, DecisionsScoreAnswer>,
+	docQuestions: Record<string, Question>,
+	docFlags: string[] = [],
+	stats?: Stats,
+): string {
+	const flaggedLines: Array<{
+		lineNum: number;
+		text: string;
+		rules: string[];
+	}> = [];
+	for (let lineIndex = 0; lineIndex < allLines.length; lineIndex++) {
+		const lineFlags = flags.get(lineIndex);
+		if (lineFlags?.length) {
+			flaggedLines.push({
+				lineNum: lineIndex + 1,
+				text: allLines[lineIndex],
+				rules: lineFlags,
+			});
+		}
+	}
+
+	const document: Record<
+		string,
+		| { score: number; max: number; confidence: number; label: string }
+		| { type: "noul"; rule: string }
+	> = {};
+
+	for (const rule of docFlags) {
+		document[rule] = { type: "noul", rule };
+	}
+
+	for (const [key, answer] of Object.entries(scores)) {
+		const q = docQuestions[key];
+		const criteria = q?.criteria as string[] | undefined;
+		if (!criteria || !Array.isArray(criteria)) continue;
+		const max = criteria.length - 1;
+		const { score, confidence = 0 } = answer;
+		if (!isScoreViolation(score, max)) continue;
+
+		const tier = confidenceTier(confidence);
+		const frac = score % 1;
+		const isBetween = frac > 0.2 && frac < 0.8;
+		const showBoth = isBetween && tier !== "high";
+		let label: string;
+		if (showBoth) {
+			const lo = criteria[Math.floor(score)] ?? "";
+			const hi = criteria[Math.ceil(score)] ?? "";
+			const trim = (s: string) => s.split(" — ")[0] ?? s;
+			label = `${trim(lo)} ↔ ${trim(hi)}`;
+		} else {
+			label = criteria[Math.round(score)] ?? "";
+		}
+		document[key] = { score, max, confidence, label };
+	}
+
+	return JSON.stringify(
+		{
+			file: filePath,
+			rules: rulesPaths,
+			violations: { lines: flaggedLines, document },
+			...(stats ? { stats } : {}),
+		},
+		null,
+		2,
+	);
+}

@@ -1,0 +1,22 @@
+# Runtime data (created at install destination, not in repo)
+db/
+teams/
+.DS_Store
+.codex/
+.claude/
+.opencode/
+
+/.omc/
+/.omx/
+/backlog/
+
+# Local secrets (notarization credentials, updater signing key, etc.) — never commit
+.env
+.env.*
+/.secrets/
+run/
+
+# Python bytecode cache, created by running the antigravity supervisor
+# directly (e.g. py_compile, or importing it in a test)
+__pycache__/
+*.pyc

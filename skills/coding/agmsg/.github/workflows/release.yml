@@ -1,0 +1,154 @@
+# Release pipeline driven by the canonical VERSION file.
+#
+# Trigger: push of a tag matching v*.*.*  (e.g. v1.0.1, v1.2.3-beta.1).
+#
+# Steps:
+#   1. Guard: the tag matches VERSION, and every derived version is already
+#      in sync. The local flow is `sync-version.sh` before tagging, so a
+#      mismatch here means the human forgot to commit the bump.
+#   2. Publish to npm via Trusted Publisher (OIDC).
+#   3. Cut a GitHub Release.
+#
+# Auth: npm Trusted Publisher (OIDC). No NPM_TOKEN secret. The binding on
+# npmjs.com requires publishes from this repo, this workflow file, and the
+# `production` environment — all three must match.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write  # for creating the GitHub Release
+  id-token: write  # for npm publish --provenance (OIDC attestation)
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    # The `production` environment gates the publish step behind a required
+    # reviewer (configured in repo Settings → Environments). A pushed tag
+    # won't ship to npm until a human approves the deployment.
+    environment: production
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history + tags so git-cliff can build release notes
+
+      - name: Resolve version from tag
+        id: ver
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          file_version="$(tr -d '[:space:]' < VERSION)"
+          if [[ "$version" != "$file_version" ]]; then
+            echo "::error::Tag ($version) does not match VERSION file ($file_version). Bump VERSION + run scripts/release/sync-version.sh before tagging." >&2
+            exit 1
+          fi
+          # A prerelease must not become what `npm install agmsg` gives people.
+          # Decided from the version itself rather than passed in by whoever
+          # pushes the tag, because that is the one mistake this workflow
+          # exists to make impossible.
+          #
+          # npm reads nothing from the version string on its own: with no
+          # --tag, `1.2.0-rc.1` publishes as `latest` exactly like `1.2.0`.
+          # As of 2026-08-07 `npm view agmsg dist-tags` is `{ latest: 1.1.13 }`
+          # and nothing else, so before this there was no tag a prerelease
+          # could have landed on.
+          if [[ "$version" == *-* ]]; then
+            echo "dist_tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Releasing $version"
+
+      - name: Verify derived files are in sync
+        run: bash scripts/release/sync-version.sh --check
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+        # Intentionally NOT setting `registry-url` — that injects a
+        # `_authToken=${NODE_AUTH_TOKEN}` line into a generated .npmrc and
+        # sets NODE_AUTH_TOKEN to a placeholder. npm then sees a non-empty
+        # token and skips the Trusted Publisher OIDC exchange, ending in a
+        # 404 from registry.npmjs.org. With no registry-url, npm uses its
+        # default registry and falls through to OIDC.
+
+      - name: Upgrade npm for Trusted Publisher OIDC
+        # npm CLI >= 11.5.1 picks up the GitHub OIDC token automatically and
+        # exchanges it with npmjs.com. Node 22's bundled npm (10.x) doesn't.
+        run: |
+          npm install -g npm@latest
+          hash -r
+          npm --version
+
+      - name: Publish to npm
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          DIST_TAG: ${{ steps.ver.outputs.dist_tag }}
+        run: |
+          published=$(npm view "agmsg@$VERSION" version 2>/dev/null || true)
+          if [[ "$published" == "$VERSION" ]]; then
+            echo "agmsg@$VERSION already on npm — skipping publish"
+            exit 0
+          fi
+          echo "publishing agmsg@$VERSION under dist-tag '$DIST_TAG'"
+          # --provenance attaches a signed GitHub attestation linking the
+          # tarball to this workflow run. No NODE_AUTH_TOKEN — auth comes
+          # from the Trusted Publisher OIDC exchange.
+          #
+          # Provenance attests a tarball against a PUBLIC source repository,
+          # which this one is. The private copy of this workflow drops the
+          # flag for that reason; the reason is inverted here, not shared, so
+          # it does not travel back with the dist-tag.
+          npm publish --access public --provenance --tag "$DIST_TAG"
+
+      # Build release notes for this tag from Conventional Commits, matching
+      # the CHANGELOG.md format. `--latest` emits only the newest release's
+      # section; `--strip header` drops the file preamble.
+      - name: Generate release notes
+        uses: orhun/git-cliff-action@v4.8.0
+        id: cliff
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          DIST_TAG: ${{ steps.ver.outputs.dist_tag }}
+        run: |
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            echo "Release v$VERSION already exists — skipping"
+            exit 0
+          fi
+          # Fall back to a minimal note if git-cliff produced nothing.
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "Release $VERSION. See [commit history](../../commits/v$VERSION) for details." > RELEASE_NOTES.md
+          fi
+          # The same decision, on the other surface it is visible from. A
+          # release candidate that is not npm's `latest` must not be the
+          # repository's latest release either — `gh release create` marks
+          # whatever it makes as latest unless told, so leaving this out
+          # publishes the rc as the release the front page offers.
+          #
+          # A string rather than an array, which is what the private copy
+          # uses. Expanding an EMPTY array as "${arr[@]}" is an unbound
+          # variable under `set -u` in bash 3.2, and this step is one nobody
+          # runs until a release is already half done. The runner's shell does
+          # not set -u today, so the array form works — but "works because of
+          # a flag nobody set" is the kind of thing a later edit removes.
+          prerelease=
+          if [ "$DIST_TAG" != latest ]; then prerelease=--prerelease; fi
+          gh release create "v$VERSION" \
+            --title "v$VERSION" \
+            --notes-file RELEASE_NOTES.md \
+            ${prerelease:+"$prerelease"}
